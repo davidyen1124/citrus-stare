@@ -1,5 +1,5 @@
-import './style.css'
 import { FaceLandmarker, FilesetResolver } from '@mediapipe/tasks-vision'
+import './style.css'
 
 const app = document.querySelector('#app')
 
@@ -11,20 +11,6 @@ app.innerHTML = `
         <video id="video" autoplay muted playsinline></video>
         <canvas id="overlay"></canvas>
       </div>
-      <div class="hud" role="status" aria-live="polite">
-        <div class="hud-row">
-          <span class="hud-label">Status</span>
-          <span id="status" class="hud-value" data-tone="loading">Booting…</span>
-        </div>
-        <div class="hud-row">
-          <span class="hud-label">Faces</span>
-          <span id="faces" class="hud-value">0</span>
-        </div>
-        <div class="hud-row">
-          <span class="hud-label">FPS</span>
-          <span id="fps" class="hud-value">--</span>
-        </div>
-      </div>
       <div id="message" class="message" aria-live="polite"></div>
     </div>
   </div>
@@ -33,36 +19,21 @@ app.innerHTML = `
 const video = document.querySelector('#video')
 const canvas = document.querySelector('#overlay')
 const ctx = canvas.getContext('2d')
-const statusEl = document.querySelector('#status')
-const facesEl = document.querySelector('#faces')
-const fpsEl = document.querySelector('#fps')
 const messageEl = document.querySelector('#message')
 
 let faceLandmarker
 let lastVideoTime = -1
-let lastFpsSample = performance.now()
-let frames = 0
 
 const modelAssetPath =
   'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task'
 const wasmPath =
   'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm'
-const tessellationConnections =
-  FaceLandmarker.FACE_LANDMARKS_TESSELATION ??
-  FaceLandmarker.FACE_LANDMARKS_CONTOURS ??
-  []
-
-const statusTones = {
-  loading: 'loading',
-  ready: 'ready',
-  warning: 'warning',
-  error: 'error'
-}
-
-function setStatus(text, tone = statusTones.ready) {
-  statusEl.textContent = text
-  statusEl.dataset.tone = tone
-}
+const leftEyeConnections = FaceLandmarker.FACE_LANDMARKS_LEFT_EYE ?? []
+const rightEyeConnections = FaceLandmarker.FACE_LANDMARKS_RIGHT_EYE ?? []
+const mouthConnections = FaceLandmarker.FACE_LANDMARKS_LIPS ?? []
+const leftEyeLoop = buildLoop(leftEyeConnections)
+const rightEyeLoop = buildLoop(rightEyeConnections)
+const mouthLoop = buildLoop(mouthConnections)
 
 function setMessage(text = '') {
   messageEl.textContent = text
@@ -98,50 +69,92 @@ function getCoverTransform() {
   return { scale, offsetX, offsetY, videoWidth, videoHeight }
 }
 
-function drawConnections(landmarks, connections = [], transform) {
-  if (!connections || typeof connections[Symbol.iterator] !== 'function') return
-  ctx.strokeStyle = 'rgba(80, 230, 208, 0.75)'
-  ctx.lineWidth = 1.1
+function buildLoop(connections) {
+  if (!connections || typeof connections[Symbol.iterator] !== 'function') return []
+  const adjacency = new Map()
   for (const connection of connections) {
     const start =
       connection?.start ?? (Array.isArray(connection) ? connection[0] : null)
     const end =
       connection?.end ?? (Array.isArray(connection) ? connection[1] : null)
     if (start == null || end == null) continue
-    const from = landmarks[start]
-    const to = landmarks[end]
-    if (!from || !to) continue
-    const x1 = from.x * transform.videoWidth * transform.scale + transform.offsetX
-    const y1 = from.y * transform.videoHeight * transform.scale + transform.offsetY
-    const x2 = to.x * transform.videoWidth * transform.scale + transform.offsetX
-    const y2 = to.y * transform.videoHeight * transform.scale + transform.offsetY
+    if (!adjacency.has(start)) adjacency.set(start, new Set())
+    if (!adjacency.has(end)) adjacency.set(end, new Set())
+    adjacency.get(start).add(end)
+    adjacency.get(end).add(start)
+  }
+  if (!adjacency.size) return []
+
+  const start = adjacency.keys().next().value
+  const loop = [start]
+  let previous = null
+  let current = start
+
+  while (true) {
+    const neighbors = Array.from(adjacency.get(current) ?? [])
+    if (!neighbors.length) break
+    const next = neighbors.find((node) => node !== previous) ?? neighbors[0]
+    if (next === start) break
+    if (loop.includes(next)) break
+    loop.push(next)
+    previous = current
+    current = next
+    if (loop.length > adjacency.size + 2) break
+  }
+
+  return loop
+}
+
+function getLoopPoints(landmarks, loop, transform) {
+  if (!loop || loop.length < 3) return null
+  const points = []
+  for (const index of loop) {
+    const point = landmarks[index]
+    if (!point) return null
+    points.push({
+      x: point.x * transform.videoWidth * transform.scale + transform.offsetX,
+      y: point.y * transform.videoHeight * transform.scale + transform.offsetY
+    })
+  }
+  return points
+}
+
+function drawEyeWindow(
+  landmarks,
+  loop,
+  transform,
+  { strokeStyle, lineWidth, drawOutline = true }
+) {
+  const points = getLoopPoints(landmarks, loop, transform)
+  if (!points) return
+
+  ctx.save()
+  ctx.beginPath()
+  ctx.moveTo(points[0].x, points[0].y)
+  for (let i = 1; i < points.length; i += 1) {
+    ctx.lineTo(points[i].x, points[i].y)
+  }
+  ctx.closePath()
+  ctx.clip()
+  ctx.drawImage(
+    video,
+    transform.offsetX,
+    transform.offsetY,
+    transform.videoWidth * transform.scale,
+    transform.videoHeight * transform.scale
+  )
+  ctx.restore()
+
+  if (drawOutline) {
     ctx.beginPath()
-    ctx.moveTo(x1, y1)
-    ctx.lineTo(x2, y2)
+    ctx.moveTo(points[0].x, points[0].y)
+    for (let i = 1; i < points.length; i += 1) {
+      ctx.lineTo(points[i].x, points[i].y)
+    }
+    ctx.closePath()
+    ctx.strokeStyle = strokeStyle
+    ctx.lineWidth = lineWidth
     ctx.stroke()
-  }
-}
-
-function drawLandmarks(landmarks, transform) {
-  ctx.fillStyle = 'rgba(255, 255, 255, 0.7)'
-  for (const point of landmarks) {
-    const x = point.x * transform.videoWidth * transform.scale + transform.offsetX
-    const y = point.y * transform.videoHeight * transform.scale + transform.offsetY
-    ctx.beginPath()
-    ctx.arc(x, y, 0.7, 0, Math.PI * 2)
-    ctx.fill()
-  }
-}
-
-function updateFps() {
-  frames += 1
-  const now = performance.now()
-  const elapsed = now - lastFpsSample
-  if (elapsed > 900) {
-    const fps = Math.round((frames * 1000) / elapsed)
-    fpsEl.textContent = `${fps}`
-    frames = 0
-    lastFpsSample = now
   }
 }
 
@@ -194,7 +207,7 @@ function describeInitError(error) {
 }
 
 async function setupFaceLandmarker() {
-  setStatus('Loading model…', statusTones.loading)
+  setMessage('Loading model…')
   const resolver = await FilesetResolver.forVisionTasks(wasmPath)
   faceLandmarker = await FaceLandmarker.createFromOptions(resolver, {
     baseOptions: {
@@ -210,14 +223,11 @@ async function init() {
   try {
     setMessage('Allow camera access to begin.')
     await setupFaceLandmarker()
-    setStatus('Requesting camera…', statusTones.loading)
     await startCamera()
     setMessage('')
-    setStatus('Live', statusTones.ready)
     requestAnimationFrame(predict)
   } catch (error) {
     console.error(error)
-    setStatus('Error', statusTones.error)
     setMessage(describeInitError(error))
   }
 }
@@ -235,22 +245,33 @@ function predict() {
 
     const dpr = window.devicePixelRatio || 1
     ctx.clearRect(0, 0, canvas.width / dpr, canvas.height / dpr)
+    ctx.fillStyle = '#000000'
+    ctx.fillRect(0, 0, canvas.width / dpr, canvas.height / dpr)
 
     if (results.faceLandmarks?.length) {
       const transform = getCoverTransform()
       if (transform) {
         for (const landmarks of results.faceLandmarks) {
-          drawConnections(landmarks, tessellationConnections, transform)
-          drawLandmarks(landmarks, transform)
+          drawEyeWindow(landmarks, leftEyeLoop, transform, {
+            strokeStyle: 'rgba(124, 255, 214, 0.95)',
+            lineWidth: 2,
+            drawOutline: false
+          })
+          drawEyeWindow(landmarks, rightEyeLoop, transform, {
+            strokeStyle: 'rgba(120, 192, 255, 0.95)',
+            lineWidth: 2,
+            drawOutline: false
+          })
+          drawEyeWindow(landmarks, mouthLoop, transform, {
+            strokeStyle: 'rgba(255, 168, 120, 0.95)',
+            lineWidth: 2,
+            drawOutline: false
+          })
         }
       }
-      facesEl.textContent = `${results.faceLandmarks.length}`
-    } else {
-      facesEl.textContent = '0'
     }
   }
 
-  updateFps()
   requestAnimationFrame(predict)
 }
 
