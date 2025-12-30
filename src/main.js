@@ -1,4 +1,6 @@
 import { FaceLandmarker, FilesetResolver } from '@mediapipe/tasks-vision'
+import * as THREE from 'three'
+import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js'
 import './style.css'
 
 const app = document.querySelector('#app')
@@ -8,6 +10,7 @@ app.innerHTML = `
     <div class="backdrop"></div>
     <div class="stage">
       <div class="viewport">
+        <canvas id="three"></canvas>
         <video id="video" autoplay muted playsinline></video>
         <canvas id="overlay"></canvas>
       </div>
@@ -17,12 +20,28 @@ app.innerHTML = `
 `
 
 const video = document.querySelector('#video')
+const viewport = document.querySelector('.viewport')
+const threeCanvas = document.querySelector('#three')
 const canvas = document.querySelector('#overlay')
 const ctx = canvas.getContext('2d')
 const messageEl = document.querySelector('#message')
 
 let faceLandmarker
 let lastVideoTime = -1
+
+let renderer
+let scene
+let camera
+let model
+let modelGroup
+let modelPivot
+let modelBaseSize = 1
+let modelReady = false
+const modelState = {
+  position: new THREE.Vector3(),
+  quaternion: new THREE.Quaternion(),
+  scale: 1
+}
 
 const modelAssetPath =
   'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task'
@@ -41,8 +60,8 @@ function setMessage(text = '') {
 }
 
 function resizeCanvas() {
-  const displayWidth = video.clientWidth
-  const displayHeight = video.clientHeight
+  const displayWidth = viewport.clientWidth
+  const displayHeight = viewport.clientHeight
   if (!displayWidth || !displayHeight) return
 
   const dpr = window.devicePixelRatio || 1
@@ -53,11 +72,21 @@ function resizeCanvas() {
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
   ctx.lineJoin = 'round'
   ctx.lineCap = 'round'
+
+  if (renderer && camera) {
+    renderer.setPixelRatio(dpr)
+    renderer.setSize(displayWidth, displayHeight, false)
+    camera.left = -displayWidth / 2
+    camera.right = displayWidth / 2
+    camera.top = displayHeight / 2
+    camera.bottom = -displayHeight / 2
+    camera.updateProjectionMatrix()
+  }
 }
 
 function getCoverTransform() {
-  const displayWidth = canvas.clientWidth
-  const displayHeight = canvas.clientHeight
+  const displayWidth = viewport.clientWidth
+  const displayHeight = viewport.clientHeight
   const videoWidth = video.videoWidth
   const videoHeight = video.videoHeight
   if (!displayWidth || !displayHeight || !videoWidth || !videoHeight) return null
@@ -105,6 +134,40 @@ function buildLoop(connections) {
   return loop
 }
 
+function getCenter(points) {
+  const total = points.reduce(
+    (acc, point) => {
+      acc.x += point.x
+      acc.y += point.y
+      return acc
+    },
+    { x: 0, y: 0 }
+  )
+  return {
+    x: total.x / points.length,
+    y: total.y / points.length
+  }
+}
+
+function getCenter3D(landmarks, indices) {
+  let count = 0
+  const total = { x: 0, y: 0, z: 0 }
+  for (const index of indices) {
+    const point = landmarks[index]
+    if (!point) continue
+    total.x += point.x
+    total.y += point.y
+    total.z += point.z ?? 0
+    count += 1
+  }
+  if (!count) return null
+  return {
+    x: total.x / count,
+    y: total.y / count,
+    z: total.z / count
+  }
+}
+
 function getLoopPoints(landmarks, loop, transform) {
   if (!loop || loop.length < 3) return null
   const points = []
@@ -119,15 +182,124 @@ function getLoopPoints(landmarks, loop, transform) {
   return points
 }
 
-function drawEyeWindow(
-  landmarks,
-  loop,
-  transform,
-  { strokeStyle, lineWidth, drawOutline = true }
-) {
-  const points = getLoopPoints(landmarks, loop, transform)
-  if (!points) return
+function getLandmarkBounds(landmarks, transform) {
+  if (!landmarks?.length || !transform) return null
+  const min = { x: Infinity, y: Infinity }
+  const max = { x: -Infinity, y: -Infinity }
+  for (const point of landmarks) {
+    const x =
+      point.x * transform.videoWidth * transform.scale + transform.offsetX
+    const y =
+      point.y * transform.videoHeight * transform.scale + transform.offsetY
+    min.x = Math.min(min.x, x)
+    min.y = Math.min(min.y, y)
+    max.x = Math.max(max.x, x)
+    max.y = Math.max(max.y, y)
+  }
+  return {
+    min,
+    max,
+    centerX: (min.x + max.x) / 2,
+    centerY: (min.y + max.y) / 2,
+    width: max.x - min.x,
+    height: max.y - min.y
+  }
+}
 
+function averageNormalizedPoints(points) {
+  let count = 0
+  const total = { x: 0, y: 0, z: 0 }
+  for (const point of points) {
+    if (!point) continue
+    total.x += point.x
+    total.y += point.y
+    total.z += point.z ?? 0
+    count += 1
+  }
+  if (!count) return null
+  return {
+    x: total.x / count,
+    y: total.y / count,
+    z: total.z / count
+  }
+}
+
+function normalizedToWorld(
+  point,
+  transform,
+  zScale,
+  viewportWidth,
+  viewportHeight
+) {
+  const x = point.x * transform.videoWidth * transform.scale + transform.offsetX
+  const y = point.y * transform.videoHeight * transform.scale + transform.offsetY
+  const z = (point.z ?? 0) * zScale
+  return new THREE.Vector3(
+    x - viewportWidth / 2,
+    viewportHeight / 2 - y,
+    -z
+  )
+}
+
+function getFaceQuaternion({
+  leftEye,
+  rightEye,
+  forehead,
+  chin,
+  transform,
+  zScale,
+  viewportWidth,
+  viewportHeight
+}) {
+  if (!leftEye || !rightEye || !forehead || !chin) return null
+  const left = normalizedToWorld(
+    leftEye,
+    transform,
+    zScale,
+    viewportWidth,
+    viewportHeight
+  )
+  const right = normalizedToWorld(
+    rightEye,
+    transform,
+    zScale,
+    viewportWidth,
+    viewportHeight
+  )
+  const upPoint = normalizedToWorld(
+    forehead,
+    transform,
+    zScale,
+    viewportWidth,
+    viewportHeight
+  )
+  const downPoint = normalizedToWorld(
+    chin,
+    transform,
+    zScale,
+    viewportWidth,
+    viewportHeight
+  )
+
+  const xAxis = right.sub(left).normalize()
+  const upAxis = upPoint.sub(downPoint).normalize()
+
+  if (xAxis.lengthSq() < 1e-6 || upAxis.lengthSq() < 1e-6) return null
+
+  const zAxis = new THREE.Vector3().crossVectors(xAxis, upAxis).normalize()
+  const correctedUp = new THREE.Vector3().crossVectors(zAxis, xAxis).normalize()
+
+  const basis = new THREE.Matrix4().makeBasis(xAxis, correctedUp, zAxis)
+  return new THREE.Quaternion().setFromRotationMatrix(basis)
+}
+
+function drawFeatureWindow(
+  points,
+  transform,
+  { contentScale = 1, contentOffsetX = 0, contentOffsetY = 0 } = {}
+) {
+  if (!points || points.length < 3) return
+  const center = getCenter(points)
   ctx.save()
   ctx.beginPath()
   ctx.moveTo(points[0].x, points[0].y)
@@ -136,6 +308,9 @@ function drawEyeWindow(
   }
   ctx.closePath()
   ctx.clip()
+  ctx.translate(center.x + contentOffsetX, center.y + contentOffsetY)
+  ctx.scale(contentScale, contentScale)
+  ctx.translate(-center.x, -center.y)
   ctx.drawImage(
     video,
     transform.offsetX,
@@ -144,18 +319,75 @@ function drawEyeWindow(
     transform.videoHeight * transform.scale
   )
   ctx.restore()
+}
 
-  if (drawOutline) {
-    ctx.beginPath()
-    ctx.moveTo(points[0].x, points[0].y)
-    for (let i = 1; i < points.length; i += 1) {
-      ctx.lineTo(points[i].x, points[i].y)
+function initThree() {
+  renderer = new THREE.WebGLRenderer({
+    canvas: threeCanvas,
+    antialias: true,
+    alpha: false
+  })
+  renderer.setClearColor(0x000000, 1)
+  renderer.outputColorSpace = THREE.SRGBColorSpace
+  renderer.toneMapping = THREE.ACESFilmicToneMapping
+  renderer.toneMappingExposure = 1.1
+
+  scene = new THREE.Scene()
+  camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.1, 2000)
+  camera.position.z = 800
+  modelGroup = new THREE.Group()
+  modelPivot = new THREE.Group()
+  modelGroup.add(modelPivot)
+  scene.add(modelGroup)
+
+  const hemi = new THREE.HemisphereLight(0xfff2d4, 0x1b1b1b, 0.6)
+  scene.add(hemi)
+  const key = new THREE.DirectionalLight(0xfff0d8, 1.2)
+  key.position.set(200, 300, 400)
+  scene.add(key)
+  const rim = new THREE.DirectionalLight(0xffa95a, 0.6)
+  rim.position.set(-200, 120, -300)
+  scene.add(rim)
+
+  const loader = new GLTFLoader()
+  loader.load(
+    '/orange.glb',
+    (gltf) => {
+      model = gltf.scene
+      model.traverse((child) => {
+        if (!child.isMesh) return
+        const materials = Array.isArray(child.material)
+          ? child.material
+          : [child.material]
+        materials.forEach((material) => {
+          if (material?.map) {
+            material.map.colorSpace = THREE.SRGBColorSpace
+          } else if (material?.color) {
+            material.color.set('#ff8a1f')
+          }
+          if (material) {
+            material.metalness = 0.1
+            material.roughness = 0.6
+            material.needsUpdate = true
+          }
+        })
+      })
+
+      const box = new THREE.Box3().setFromObject(model)
+      const size = new THREE.Vector3()
+      box.getSize(size)
+      modelBaseSize = Math.max(size.x, size.y, size.z) || 1
+      const center = new THREE.Vector3()
+      box.getCenter(center)
+      model.position.sub(center)
+      modelPivot.add(model)
+      modelReady = true
+    },
+    undefined,
+    () => {
+      setMessage('Failed to load the orange model.')
     }
-    ctx.closePath()
-    ctx.strokeStyle = strokeStyle
-    ctx.lineWidth = lineWidth
-    ctx.stroke()
-  }
+  )
 }
 
 async function startCamera() {
@@ -222,6 +454,7 @@ async function setupFaceLandmarker() {
 async function init() {
   try {
     setMessage('Allow camera access to begin.')
+    initThree()
     await setupFaceLandmarker()
     await startCamera()
     setMessage('')
@@ -245,31 +478,110 @@ function predict() {
 
     const dpr = window.devicePixelRatio || 1
     ctx.clearRect(0, 0, canvas.width / dpr, canvas.height / dpr)
-    ctx.fillStyle = '#000000'
-    ctx.fillRect(0, 0, canvas.width / dpr, canvas.height / dpr)
 
     if (results.faceLandmarks?.length) {
       const transform = getCoverTransform()
       if (transform) {
         for (const landmarks of results.faceLandmarks) {
-          drawEyeWindow(landmarks, leftEyeLoop, transform, {
-            strokeStyle: 'rgba(124, 255, 214, 0.95)',
-            lineWidth: 2,
-            drawOutline: false
-          })
-          drawEyeWindow(landmarks, rightEyeLoop, transform, {
-            strokeStyle: 'rgba(120, 192, 255, 0.95)',
-            lineWidth: 2,
-            drawOutline: false
-          })
-          drawEyeWindow(landmarks, mouthLoop, transform, {
-            strokeStyle: 'rgba(255, 168, 120, 0.95)',
-            lineWidth: 2,
-            drawOutline: false
-          })
+          const leftEyePoints = getLoopPoints(landmarks, leftEyeLoop, transform)
+          const rightEyePoints = getLoopPoints(
+            landmarks,
+            rightEyeLoop,
+            transform
+          )
+          const mouthPoints = getLoopPoints(landmarks, mouthLoop, transform)
+
+          if (leftEyePoints && rightEyePoints) {
+            drawFeatureWindow(leftEyePoints, transform)
+            drawFeatureWindow(rightEyePoints, transform)
+            if (mouthPoints) drawFeatureWindow(mouthPoints, transform)
+
+            if (modelReady && modelGroup) {
+              const bounds = getLandmarkBounds(landmarks, transform)
+              if (!bounds) continue
+
+              const viewportWidth = viewport.clientWidth
+              const viewportHeight = viewport.clientHeight
+              const faceWidth = bounds.width
+              const targetScale =
+                (faceWidth * 1.8) / (modelBaseSize || 1)
+
+              const leftEyeCenter = getCenter(leftEyePoints)
+              const rightEyeCenter = getCenter(rightEyePoints)
+              const eyeDx = rightEyeCenter.x - leftEyeCenter.x
+              const eyeDy = rightEyeCenter.y - leftEyeCenter.y
+              const roll = Math.atan2(eyeDy, eyeDx)
+
+              const leftEye3D = getCenter3D(landmarks, leftEyeLoop)
+              const rightEye3D = getCenter3D(landmarks, rightEyeLoop)
+              const mouth3D = getCenter3D(landmarks, mouthLoop)
+              const nose = landmarks[1]
+              const forehead = landmarks[10]
+              const chin = landmarks[152]
+              const zScale = faceWidth || transform.videoWidth * transform.scale
+
+              const anchor = averageNormalizedPoints([
+                leftEye3D,
+                rightEye3D,
+                mouth3D,
+                nose
+              ])
+
+              const targetPosition = anchor
+                ? normalizedToWorld(
+                    anchor,
+                    transform,
+                    zScale,
+                    viewportWidth,
+                    viewportHeight
+                  )
+                : new THREE.Vector3(
+                    bounds.centerX - viewportWidth / 2,
+                    viewportHeight / 2 - bounds.centerY,
+                    0
+                  )
+              targetPosition.z = 0
+
+              const faceQuaternion = getFaceQuaternion({
+                leftEye: leftEye3D,
+                rightEye: rightEye3D,
+                forehead,
+                chin,
+                transform,
+                zScale,
+                viewportWidth,
+                viewportHeight
+              })
+
+              const targetQuaternion = faceQuaternion
+                ? faceQuaternion
+                : new THREE.Quaternion().setFromEuler(
+                    new THREE.Euler(0, 0, roll)
+                  )
+
+              modelState.position.lerp(
+                targetPosition,
+                0.2
+              )
+              modelState.quaternion.slerp(targetQuaternion, 0.2)
+              modelState.scale =
+                modelState.scale * 0.82 + targetScale * 0.18
+
+              modelGroup.position.copy(modelState.position)
+              modelGroup.scale.setScalar(modelState.scale)
+              modelGroup.quaternion.copy(modelState.quaternion)
+              modelGroup.visible = true
+            }
+          }
         }
       }
+    } else if (modelGroup) {
+      modelGroup.visible = false
     }
+  }
+
+  if (renderer && scene && camera) {
+    renderer.render(scene, camera)
   }
 
   requestAnimationFrame(predict)

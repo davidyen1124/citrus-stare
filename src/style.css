@@ -58,6 +58,7 @@ body {
   display: none;
 }
 
+#three,
 #video,
 #overlay {
   position: absolute;
@@ -68,11 +69,16 @@ body {
   transform: scaleX(-1);
 }
 
+#three {
+  z-index: 0;
+}
+
 #video {
   opacity: 0;
 }
 
 #overlay {
+  z-index: 2;
   mix-blend-mode: normal;
 }
 
